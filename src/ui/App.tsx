@@ -1,10 +1,12 @@
-import type { Progress } from '@/core/types';
+import { useSyncExternalStore } from 'react';
+import type { Progress } from '@/core/domain';
 import { AppliedView } from './AppliedView';
 import { CartSection } from './CartSection';
+import { type Session, type State, requirementQuantity } from './machine';
+import type { Optimizer } from './optimizer';
 import { OptionsPanel } from './OptionsPanel';
 import { PlanView } from './PlanView';
 import { TabPicker } from './TabPicker';
-import { useOptimizer } from './useOptimizer';
 
 const PHASES: Record<Progress['phase'], string> = {
   listings: 'Fetching listings',
@@ -12,7 +14,7 @@ const PHASES: Record<Progress['phase'], string> = {
   cart: 'Adding items to your cart',
 };
 
-function ProgressPanel({ title, progress, onCancel }: { title: string; progress: Progress | null; onCancel?: () => void }) {
+export function ProgressPanel({ title, progress, onCancel }: { title: string; progress: Progress | null; onCancel?: () => void }) {
   return (
     <section className="panel progress" aria-live="polite" aria-busy="true">
       <div className="panel-head">
@@ -40,65 +42,94 @@ function ProgressPanel({ title, progress, onCancel }: { title: string; progress:
   );
 }
 
-export function App() {
-  const { state, actions } = useOptimizer();
-  const { stage } = state;
-  const busy = stage.kind === 'loading' || stage.kind === 'optimizing' || stage.kind === 'applying' || stage.kind === 'connecting';
-  const sellerNames = new Map([...state.sellers.values()].map((s) => [s.sellerKey, s.name]));
-  const canOptimize = state.requirements.some((r) => (state.quantities[r.id] ?? r.quantity) > 0);
+export function ErrorNotice({ error, onDismiss }: { error: string; onDismiss?: () => void }) {
+  return (
+    <div className="notice error" role="alert">
+      <p>{error}</p>
+      {onDismiss && (
+        <button type="button" className="link" onClick={onDismiss}>
+          Dismiss
+        </button>
+      )}
+    </div>
+  );
+}
 
+/** The cart, the options and the plan, for every state that has a loaded cart. */
+function Workspace({ state, session, optimizer }: { state: State; session: Session; optimizer: Optimizer }) {
+  const busy = state._tag !== 'Editing' && state._tag !== 'Planned';
+  const canOptimize = session.catalog.requirements.some((r) => requirementQuantity(session, r) > 0);
+  return (
+    <>
+      <CartSection session={session} optimizer={optimizer} busy={busy} />
+      {session.cart.length > 0 && (
+        <>
+          <OptionsPanel options={session.options} optimizer={optimizer} disabled={busy} />
+          <div className="actions">
+            <button type="button" className="primary" disabled={busy || !canOptimize} onClick={optimizer.optimize}>
+              {state._tag === 'Planned' ? 'Optimize again' : 'Optimize'}
+            </button>
+          </div>
+        </>
+      )}
+      {state._tag === 'Optimizing' && <ProgressPanel title="Optimizing" progress={state.progress} onCancel={optimizer.cancel} />}
+      {state._tag === 'Applying' && <ProgressPanel title="Updating your cart" progress={state.progress} />}
+      {(state._tag === 'Planned' || state._tag === 'Applying') && (
+        <PlanView plan={state.plan} session={session} optimizer={optimizer} busy={busy} />
+      )}
+    </>
+  );
+}
+
+function Body({ state, optimizer }: { state: State; optimizer: Optimizer }) {
+  switch (state._tag) {
+    case 'Connecting':
+      return <p aria-live="polite">Connecting to TCGplayer…</p>;
+    case 'ChoosingTab':
+      return <TabPicker reason={state.reason} optimizer={optimizer} />;
+    case 'LoadFailed':
+      return (
+        <>
+          <ErrorNotice error={state.error} />
+          <div className="actions">
+            <button type="button" className="primary" onClick={optimizer.reloadCart}>
+              Reload cart
+            </button>
+          </div>
+        </>
+      );
+    case 'Loading':
+      return (
+        <>
+          <p aria-live="polite">{state.message}</p>
+          {state.session && <Workspace state={state} session={state.session} optimizer={optimizer} />}
+        </>
+      );
+    case 'Editing':
+    case 'Planned':
+      return (
+        <>
+          {state.error && <ErrorNotice error={state.error} onDismiss={optimizer.dismissError} />}
+          <Workspace state={state} session={state.session} optimizer={optimizer} />
+        </>
+      );
+    case 'Optimizing':
+    case 'Applying':
+      return <Workspace state={state} session={state.session} optimizer={optimizer} />;
+    case 'Applied':
+      return <AppliedView plan={state.plan} results={state.results} cost={state.cost} session={state.session} optimizer={optimizer} />;
+  }
+}
+
+export function App({ optimizer }: { optimizer: Optimizer }) {
+  const state = useSyncExternalStore(optimizer.subscribe, optimizer.getState);
   return (
     <main>
       <header className="page-head">
         <h1>TCGplayer Cart Optimizer</h1>
-        <p className="muted">Cheapest way to buy your cart, counting each seller’s shipping and free-shipping threshold.</p>
+        <p className="muted">The cheapest way to buy your cart, counting each seller’s shipping and free-shipping threshold.</p>
       </header>
-
-      {state.error && (
-        <div className="notice error" role="alert">
-          <p>{state.error}</p>
-          <button type="button" className="link" onClick={actions.dismissError}>
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {stage.kind === 'connecting' && <p aria-live="polite">Connecting to TCGplayer…</p>}
-      {stage.kind === 'loading' && <p aria-live="polite">{stage.message}</p>}
-      {stage.kind === 'needs-tab' && <TabPicker reason={stage.reason} actions={actions} />}
-
-      {stage.kind === 'applied' ? (
-        <AppliedView plan={stage.plan} results={stage.results} cost={stage.cost} requirements={state.requirements} actions={actions} />
-      ) : (
-        stage.kind !== 'needs-tab' &&
-        stage.kind !== 'connecting' && (
-          <>
-            <CartSection state={state} actions={actions} busy={busy} />
-            {state.options && state.cart.length > 0 && (
-              <>
-                <OptionsPanel options={state.options} sellerNames={sellerNames} actions={actions} disabled={busy} />
-                <div className="actions">
-                  <button type="button" className="primary" disabled={busy || !canOptimize} onClick={() => void actions.optimize()}>
-                    {stage.kind === 'planned' ? 'Optimize again' : 'Optimize'}
-                  </button>
-                </div>
-              </>
-            )}
-            {stage.kind === 'optimizing' && <ProgressPanel title="Optimizing" progress={stage.progress} onCancel={actions.cancel} />}
-            {stage.kind === 'applying' && <ProgressPanel title="Updating your cart" progress={stage.progress} />}
-            {(stage.kind === 'planned' || stage.kind === 'applying') && (
-              <PlanView
-                plan={stage.plan}
-                current={state.currentCost}
-                requirements={state.requirements}
-                sellers={state.sellers}
-                actions={actions}
-                busy={busy}
-              />
-            )}
-          </>
-        )
-      )}
+      <Body state={state} optimizer={optimizer} />
     </main>
   );
 }

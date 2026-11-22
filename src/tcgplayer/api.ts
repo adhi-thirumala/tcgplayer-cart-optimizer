@@ -1,25 +1,21 @@
-import type {
-  CartAddRequest,
-  CartAddResult,
-  CartLine,
-  Condition,
-  Listing,
-  Product,
-  ProductId,
-  ProgressFn,
-  SellerShipping,
-  TcgApi,
-} from '@/core/types';
-import { type Envelope, TcgHttpError, errorText, tcgFetch, unwrap } from './http';
+import { Effect, Schema } from 'effect';
+import { HttpClientRequest } from 'effect/http';
 import {
-  type RawListing,
-  type RawProduct,
-  type RawSellerShipping,
-  toCondition,
-  toListing,
-  toProduct,
-  toSellerShipping,
-} from './mappers';
+  type CartAddRequest,
+  type CartAddResult,
+  type CartLine,
+  type Condition,
+  type Listing,
+  type Product,
+  ProductId,
+  type Progress,
+  type Seller,
+  SellerId,
+  SellerKey,
+  Sku,
+} from '@/core/domain';
+import { TcgError, TcgHttp, envelopeErrors } from './http';
+import { RawListing, RawProduct, RawSeller, toListing, toProduct, toSeller } from './mappers';
 
 const SEARCH = 'https://mp-search-api.tcgplayer.com/v1';
 const MPAPI = 'https://mpapi.tcgplayer.com/v2';
@@ -27,6 +23,10 @@ const GATEWAY = 'https://mpgateway.tcgplayer.com/v1';
 const COUNTRY = 'US';
 const PAGE = 50;
 const SELLER_BATCH = 100;
+/** 200 products covers every printing of even heavily reprinted staples. */
+const MAX_SEARCH_PAGES = 4;
+
+type Report = (progress: Progress) => Effect.Effect<void>;
 
 const liveListingFilters = {
   term: { sellerStatus: 'Live', channelId: 0 },
@@ -34,46 +34,26 @@ const liveListingFilters = {
   exclude: { channelExclusion: 0 },
 };
 
-function cartKey(): string {
+const post = (url: string, body: unknown) => HttpClientRequest.post(url).pipe(HttpClientRequest.bodyJsonUnsafe(body));
+
+const cartKey = Effect.suspend(() => {
   const key = document.cookie.match(/(?:^|;\s*)StoreCart_PRODUCTION=[^;]*?CK=([0-9a-f]+)/i)?.[1];
-  if (!key) throw new Error('No TCGplayer cart found. Open your TCGplayer cart page once, then try again.');
-  return key;
-}
+  return key
+    ? Effect.succeed(key)
+    : Effect.fail(new TcgError({ message: 'No TCGplayer cart found. Open your TCGplayer cart page once, then try again.' }));
+});
 
-interface RawCartItem {
-  sku: number;
-  quantity: number;
-  currentPrice: number;
-  sellerId: number;
-  sellerKey: string;
-}
+const SearchPage = Schema.Struct({ totalResults: Schema.Int, results: Schema.Array(RawProduct) });
+const ListingPage = Schema.Struct({ totalResults: Schema.Int, results: Schema.Array(RawListing) });
 
-interface RawSkuProduct {
-  sku: number;
-  productId: number;
-  productName: string;
-  setName: string;
-  condition: string;
-  printing: string;
-  collectorNumber: string | null;
-}
-
-interface RawAddResult {
-  itemQuantityInCart: number;
-  currentPrice: number;
-  status: number;
-}
-
-/** 200 products covers every printing of even heavily reprinted staples. */
-const MAX_SEARCH_PAGES = 4;
-
-async function searchProducts(query: string): Promise<Product[]> {
+export const searchProducts = Effect.fn('searchProducts')(function* (query: string) {
+  const http = yield* TcgHttp;
   const url = `${SEARCH}/search/request?q=${encodeURIComponent(query)}&isList=false`;
   const products: Product[] = [];
   for (let page = 0; page < MAX_SEARCH_PAGES; page++) {
-    const envelope = await tcgFetch<Envelope<{ totalResults: number; results: RawProduct[] }>>(url, {
-      method: 'POST',
-      body: {
+    const result = yield* http.first(
+      'search',
+      post(url, {
         algorithm: 'sales_dismax',
         from: page * PAGE,
         size: PAGE,
@@ -82,148 +62,165 @@ async function searchProducts(query: string): Promise<Product[]> {
         context: { cart: {}, shippingCountry: COUNTRY, userProfile: {} },
         settings: { useFuzzySearch: false, didYouMean: {} },
         sort: {},
-      },
-    });
-    const result = unwrap('search', envelope);
+      }),
+      SearchPage,
+    );
     products.push(...result.results.map(toProduct));
     if (result.results.length < PAGE || products.length >= result.totalResults) break;
   }
   return products;
-}
+});
 
-async function getProducts(productIds: ProductId[]): Promise<Product[]> {
-  return Promise.all(
-    [...new Set(productIds)].map(async (id) => toProduct(await tcgFetch<RawProduct>(`${SEARCH}/product/${id}/details`))),
+export const getProducts = Effect.fn('getProducts')(function* (productIds: readonly ProductId[]) {
+  const http = yield* TcgHttp;
+  return yield* Effect.forEach(
+    new Set(productIds),
+    (id) => http.json('product details', HttpClientRequest.get(`${SEARCH}/product/${id}/details`), RawProduct).pipe(Effect.map(toProduct)),
+    { concurrency: 'unbounded' },
   );
-}
-
-function listingPage(productId: ProductId, from: number, conditions: Condition[]) {
-  return tcgFetch<Envelope<{ totalResults: number; results: RawListing[] }>>(`${SEARCH}/product/${productId}/listings`, {
-    method: 'POST',
-    body: {
-      filters: { ...liveListingFilters, term: { ...liveListingFilters.term, language: ['English'], condition: conditions } },
-      from,
-      size: PAGE,
-      sort: { field: 'price+shipping', order: 'asc' },
-      context: { shippingCountry: COUNTRY, cart: {} },
-      aggregations: ['listingType'],
-    },
-  }).then((envelope) => unwrap('listings', envelope));
-}
+});
 
 /**
- * Every listing of the given products. The API caps pages at 50, and common
- * cards have thousands of listings, so after each product's first page (which
- * reveals its total) the remaining pages are requested concurrently.
+ * Every listing of the given products. Pages hold at most 50 listings and
+ * common cards have thousands, so the first page of each product reveals its
+ * total and the remaining pages are then requested concurrently.
  */
-async function fetchListings(
-  productIds: ProductId[],
-  filter: { conditions: Condition[] },
-  onProgress?: ProgressFn,
-): Promise<Listing[]> {
+export const fetchListings = Effect.fn('fetchListings')(function* (
+  productIds: readonly ProductId[],
+  conditions: readonly Condition[],
+  report: Report,
+) {
+  const http = yield* TcgHttp;
+  const listingPage = (productId: ProductId, from: number) =>
+    http.first(
+      'listings',
+      post(`${SEARCH}/product/${productId}/listings`, {
+        filters: { ...liveListingFilters, term: { ...liveListingFilters.term, language: ['English'], condition: conditions } },
+        from,
+        size: PAGE,
+        sort: { field: 'price+shipping', order: 'asc' },
+        context: { shippingCountry: COUNTRY, cart: {} },
+        aggregations: ['listingType'],
+      }),
+      ListingPage,
+    );
+
   const ids = [...new Set(productIds)];
   let done = 0;
   let total = ids.length;
-  const report = () => onProgress?.({ phase: 'listings', done, total });
-  report();
-  const perProduct = await Promise.all(
-    ids.map(async (id) => {
-      const first = await listingPage(id, 0, filter.conditions);
-      const more = Math.max(0, Math.ceil(first.totalResults / PAGE) - 1);
+  const advance = (pages: number) =>
+    Effect.suspend(() => {
       done++;
-      total += more;
-      report();
-      const rest = await Promise.all(
-        Array.from({ length: more }, async (_, i) => {
-          const page = await listingPage(id, (i + 1) * PAGE, filter.conditions);
-          done++;
-          report();
-          return page.results;
-        }),
-      );
-      return [first.results, ...rest].flat();
-    }),
-  );
-  // Listings can shift between pages while we read them; keep each once.
-  const unique = new Map<number, RawListing>();
-  for (const raw of perProduct.flat()) unique.set(raw.listingId, raw);
-  return [...unique.values()].map(toListing);
-}
+      total += pages;
+      return report({ _tag: 'Progress', phase: 'listings', done, total });
+    });
 
-async function fetchSellerShipping(sellerIds: number[], onProgress?: ProgressFn): Promise<SellerShipping[]> {
+  yield* report({ _tag: 'Progress', phase: 'listings', done, total });
+  const perProduct = yield* Effect.forEach(
+    ids,
+    (id) =>
+      Effect.gen(function* () {
+        const first = yield* listingPage(id, 0);
+        const more = Math.max(0, Math.ceil(first.totalResults / PAGE) - 1);
+        yield* advance(more);
+        const rest = yield* Effect.forEach(
+          Array.from({ length: more }, (_, i) => (i + 1) * PAGE),
+          (from) => listingPage(id, from).pipe(Effect.tap(() => advance(0))),
+          { concurrency: 'unbounded' },
+        );
+        return [first, ...rest].flatMap((page) => page.results);
+      }),
+    { concurrency: 'unbounded' },
+  );
+  // Listings shift between pages while they are read; keep each once.
+  const unique = new Map(perProduct.flat().map((raw) => [raw.listingId, raw]));
+  return [...unique.values()].map(toListing) satisfies Listing[];
+});
+
+export const fetchSellers = Effect.fn('fetchSellers')(function* (sellerIds: readonly SellerId[], report: Report) {
+  const http = yield* TcgHttp;
   const ids = [...new Set(sellerIds)];
-  const batches: number[][] = [];
-  for (let i = 0; i < ids.length; i += SELLER_BATCH) batches.push(ids.slice(i, i + SELLER_BATCH));
+  const batches = Array.from({ length: Math.ceil(ids.length / SELLER_BATCH) }, (_, i) => ids.slice(i * SELLER_BATCH, (i + 1) * SELLER_BATCH));
   let done = 0;
-  onProgress?.({ phase: 'sellers', done, total: ids.length });
-  const results = await Promise.all(
-    batches.map(async (batch) => {
-      const envelope = await tcgFetch<Envelope<RawSellerShipping[]>>(
-        `${MPAPI}/seller/shippinginfo?countryCode=${COUNTRY}`,
-        { method: 'POST', body: batch.map((sellerId) => ({ sellerId, largestShippingCategoryId: 1 })) },
-      );
-      const rules = unwrap('seller shipping', envelope).flatMap((raw) => toSellerShipping(raw) ?? []);
-      done += batch.length;
-      onProgress?.({ phase: 'sellers', done, total: ids.length });
-      return rules;
-    }),
+  yield* report({ _tag: 'Progress', phase: 'sellers', done, total: ids.length });
+  const perBatch = yield* Effect.forEach(
+    batches,
+    (batch) =>
+      http
+        .first(
+          'seller shipping',
+          post(
+            `${MPAPI}/seller/shippinginfo?countryCode=${COUNTRY}`,
+            batch.map((sellerId) => ({ sellerId, largestShippingCategoryId: 1 })),
+          ),
+          Schema.Array(RawSeller),
+        )
+        .pipe(
+          Effect.tap(() => {
+            done += batch.length;
+            return report({ _tag: 'Progress', phase: 'sellers', done, total: ids.length });
+          }),
+        ),
+    { concurrency: 'unbounded' },
   );
-  return results.flat();
-}
-
-async function readCart(): Promise<CartLine[]> {
-  const key = cartKey();
-  const envelope = await tcgFetch<Envelope<{ cartItems: RawCartItem[] }>>(
-    `${GATEWAY}/cart/${key}/validatecart?validateForCheckout=false&countryCode=${COUNTRY}`,
-    { method: 'POST' },
-  );
-  const items = unwrap('cart', envelope).cartItems;
-  if (items.length === 0) return [];
-
-  const [skuEnvelope, sellers] = await Promise.all([
-    tcgFetch<Envelope<RawSkuProduct[]>>(`${SEARCH}/product/getProductForSkus`, {
-      method: 'POST',
-      body: [...new Set(items.map((i) => i.sku))],
-    }),
-    fetchSellerShipping(items.map((i) => i.sellerId)),
-  ]);
-  const products = new Map(unwrap('cart products', skuEnvelope).map((p) => [p.sku, p]));
-  const sellerNames = new Map(sellers.map((s) => [s.sellerId, s.name]));
-
-  return items.map((item) => {
-    const product = products.get(item.sku);
-    if (!product) throw new TcgHttpError('cart products', 200, `no product for SKU ${item.sku}`);
-    return {
-      sku: item.sku,
-      productId: product.productId,
-      sellerId: item.sellerId,
-      sellerKey: item.sellerKey,
-      sellerName: sellerNames.get(item.sellerId) ?? item.sellerKey,
-      name: product.productName,
-      setName: product.setName,
-      number: product.collectorNumber,
-      condition: toCondition(product.condition),
-      printing: product.printing,
-      quantity: item.quantity,
-      price: item.currentPrice,
-    };
+  return perBatch.flat().flatMap((raw): Seller[] => {
+    const seller = toSeller(raw);
+    return seller ? [seller] : [];
   });
-}
+});
 
-async function clearCart(): Promise<void> {
-  await tcgFetch(`${GATEWAY}/cart/${cartKey()}/items/all`, { method: 'DELETE' });
-}
+const RawCart = Schema.Struct({
+  cartItems: Schema.Array(
+    Schema.Struct({ sku: Sku, quantity: Schema.Int, currentPrice: Schema.Number, sellerId: SellerId, sellerKey: SellerKey }),
+  ),
+});
+const RawSkuProduct = Schema.Struct({ sku: Sku, productId: ProductId, printing: Schema.String });
 
-async function addToCart(items: CartAddRequest[], onProgress?: ProgressFn): Promise<CartAddResult[]> {
-  const key = cartKey();
-  const results: CartAddResult[] = [];
-  onProgress?.({ phase: 'cart', done: 0, total: items.length });
-  // Sequential: concurrent adds to one cart race on TCGplayer's side.
-  for (const request of items) {
-    try {
-      const envelope = await tcgFetch<Envelope<RawAddResult>>(`${GATEWAY}/cart/${key}/item/add`, {
-        method: 'POST',
-        body: {
+export const readCart = Effect.gen(function* () {
+  const http = yield* TcgHttp;
+  const key = yield* cartKey;
+  const { cartItems } = yield* http.first(
+    'cart',
+    HttpClientRequest.post(`${GATEWAY}/cart/${key}/validatecart?validateForCheckout=false&countryCode=${COUNTRY}`),
+    RawCart,
+  );
+  if (cartItems.length === 0) return [];
+  const skus = yield* http.first(
+    'cart products',
+    post(`${SEARCH}/product/getProductForSkus`, [...new Set(cartItems.map((i) => i.sku))]),
+    Schema.Array(RawSkuProduct),
+  );
+  const bySku = new Map(skus.map((p) => [p.sku, p]));
+  return yield* Effect.forEach(cartItems, (item) => {
+    const product = bySku.get(item.sku);
+    return product
+      ? Effect.succeed<CartLine>({
+          productId: product.productId,
+          sellerId: item.sellerId,
+          printing: product.printing,
+          quantity: item.quantity,
+          price: item.currentPrice,
+        })
+      : Effect.fail(new TcgError({ message: `TCGplayer cart products failed: no product for SKU ${item.sku}` }));
+  });
+}).pipe(Effect.withSpan('readCart'));
+
+export const clearCart = Effect.gen(function* () {
+  const http = yield* TcgHttp;
+  const key = yield* cartKey;
+  yield* http.send('clear cart', HttpClientRequest.delete(`${GATEWAY}/cart/${key}/items/all`));
+}).pipe(Effect.withSpan('clearCart'));
+
+const RawAddResult = Schema.Struct({ itemQuantityInCart: Schema.Int, currentPrice: Schema.Number, status: Schema.Int });
+
+export const addToCart = Effect.fn('addToCart')(function* (items: readonly CartAddRequest[], report: Report) {
+  const http = yield* TcgHttp;
+  const key = yield* cartKey;
+  const addOne = (request: CartAddRequest) =>
+    http
+      .envelope(
+        'add to cart',
+        post(`${GATEWAY}/cart/${key}/item/add`, {
           sku: request.sku,
           sellerKey: request.sellerKey,
           channelId: 0,
@@ -231,31 +228,28 @@ async function addToCart(items: CartAddRequest[], onProgress?: ProgressFn): Prom
           price: request.price,
           isDirect: false,
           countryCode: COUNTRY,
-        },
-      });
-      const result = envelope.results?.[0];
-      const error = errorText(envelope.errors);
-      results.push({
-        request,
-        ok: !error && result?.status === 0,
-        quantityInCart: result?.itemQuantityInCart ?? 0,
-        currentPrice: result && result.currentPrice > 0 ? result.currentPrice : null,
-        error: error ?? (result?.status === 0 ? null : `status ${result?.status ?? 'missing'}`),
-      });
-    } catch (error) {
-      results.push({
-        request,
-        ok: false,
-        quantityInCart: 0,
-        currentPrice: null,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-    onProgress?.({ phase: 'cart', done: results.length, total: items.length });
-  }
-  return results;
-}
+        }),
+        RawAddResult,
+      )
+      .pipe(
+        Effect.map(({ errors, results }): CartAddResult => {
+          const result = results?.[0];
+          const reason = envelopeErrors(errors) ?? (result?.status === 0 ? null : `status ${result?.status ?? 'missing'}`);
+          return reason === null && result
+            ? {
+                _tag: 'Added',
+                request,
+                quantityInCart: result.itemQuantityInCart,
+                currentPrice: result.currentPrice > 0 ? result.currentPrice : request.price,
+              }
+            : { _tag: 'Rejected', request, reason: reason ?? 'no result' };
+        }),
+        Effect.catch((error) => Effect.succeed<CartAddResult>({ _tag: 'Rejected', request, reason: error.message })),
+      );
 
-export function createTcgApi(): TcgApi {
-  return { readCart, searchProducts, getProducts, fetchListings, fetchSellerShipping, clearCart, addToCart };
-}
+  yield* report({ _tag: 'Progress', phase: 'cart', done: 0, total: items.length });
+  // One at a time: concurrent adds to one cart race on TCGplayer's side.
+  return yield* Effect.forEach(items, (request, i) =>
+    addOne(request).pipe(Effect.tap(() => report({ _tag: 'Progress', phase: 'cart', done: i + 1, total: items.length }))),
+  );
+});

@@ -1,30 +1,29 @@
-import type { CartLine, Product, ProductId, Requirement } from '@/core/types';
-import { money } from './format';
-import { requirementQuantity, type OptimizerActions, type State } from './useOptimizer';
+import type { Product, ProductId, Requirement } from '@/core/domain';
+import { money, productUrl } from './format';
+import { type Session, requirementQuantity } from './machine';
+import type { Optimizer } from './optimizer';
 
 function printingLabel(p: Product | undefined, id: ProductId): string {
-  if (!p) return `Product ${id}`;
-  return [p.setName, p.number, p.rarity].filter(Boolean).join(' · ');
+  return p ? [p.setName, p.number, p.rarity].filter(Boolean).join(' · ') : `Product ${id}`;
 }
 
 function RequirementRow({
   requirement,
-  state,
-  actions,
+  session,
+  optimizer,
   disabled,
 }: {
   requirement: Requirement;
-  state: State;
-  actions: OptimizerActions;
+  session: Session;
+  optimizer: Optimizer;
   disabled: boolean;
 }) {
-  const quantity = requirementQuantity(state, requirement);
-  const inCart = new Map<ProductId, CartLine[]>();
-  for (const line of state.cart) {
-    if (requirement.candidates.includes(line.productId)) {
-      inCart.set(line.productId, [...(inCart.get(line.productId) ?? []), line]);
-    }
-  }
+  const { products } = session.catalog;
+  const quantity = requirementQuantity(session, requirement);
+  const inCart = Map.groupBy(
+    session.cart.filter((line) => requirement.candidates.includes(line.productId)),
+    (line) => line.productId,
+  );
   const inputId = `qty-${requirement.id}`;
 
   return (
@@ -37,15 +36,14 @@ function RequirementRow({
           {[...inCart].map(([productId, lines]) => (
             <li key={productId}>
               <span className="muted">
-                In cart: {printingLabel(state.products.get(productId), productId)} ·{' '}
-                {lines.map((l) => `${l.quantity}× ${l.printing}`).join(', ')}
+                In cart: {printingLabel(products.get(productId), productId)} · {lines.map((l) => `${l.quantity}× ${l.printing}`).join(', ')}
               </span>
               <label className="lock">
                 <input
                   type="checkbox"
-                  checked={state.pins.has(productId)}
+                  checked={session.pins.has(productId)}
                   disabled={disabled}
-                  onChange={(e) => void actions.setPinned(productId, e.currentTarget.checked)}
+                  onChange={(e) => optimizer.setPinned(productId, e.currentTarget.checked)}
                 />
                 Exact printing only
               </label>
@@ -61,10 +59,7 @@ function RequirementRow({
           max={99}
           value={quantity}
           disabled={disabled}
-          onChange={(e) => {
-            const value = Math.max(0, Math.min(99, Math.trunc(e.currentTarget.valueAsNumber || 0)));
-            actions.setQuantity(requirement.id, value);
-          }}
+          onChange={(e) => optimizer.setQuantity(requirement.id, Math.max(0, Math.min(99, Math.trunc(e.currentTarget.valueAsNumber || 0))))}
         />
       </td>
       <td>
@@ -75,10 +70,10 @@ function RequirementRow({
             <summary>{requirement.candidates.length} printings</summary>
             <ul className="printings">
               {requirement.candidates.map((id) => {
-                const p = state.products.get(id);
+                const p = products.get(id);
                 return (
                   <li key={id}>
-                    <a href={p?.url ?? `https://www.tcgplayer.com/product/${id}`} target="_blank" rel="noreferrer">
+                    <a href={productUrl(id)} target="_blank" rel="noreferrer">
                       {printingLabel(p, id)}
                     </a>
                     {p?.lowestPrice != null && <span className="muted"> from {money(p.lowestPrice)}</span>}
@@ -93,28 +88,28 @@ function RequirementRow({
   );
 }
 
-export function CartSection({ state, actions, busy }: { state: State; actions: OptimizerActions; busy: boolean }) {
-  const copies = state.cart.reduce((n, l) => n + l.quantity, 0);
-  const sellerCount = new Set(state.cart.map((l) => l.sellerId)).size;
+export function CartSection({ session, optimizer, busy }: { session: Session; optimizer: Optimizer; busy: boolean }) {
+  const { cart, cost } = session;
+  const copies = cart.reduce((n, l) => n + l.quantity, 0);
+  const sellerCount = new Set(cart.map((l) => l.sellerId)).size;
   return (
     <section className="panel" aria-labelledby="cart-title">
       <div className="panel-head">
         <h2 id="cart-title">Your cart</h2>
-        <button type="button" onClick={() => void actions.reloadCart()} disabled={busy}>
+        <button type="button" onClick={optimizer.reloadCart} disabled={busy}>
           Reload cart
         </button>
       </div>
-      {state.cart.length === 0 ? (
+      {cart.length === 0 ? (
         <p>Your TCGplayer cart is empty. Add the cards you want, then reload.</p>
       ) : (
         <>
           <p className="muted">
             {copies} {copies === 1 ? 'card' : 'cards'} from {sellerCount} {sellerCount === 1 ? 'seller' : 'sellers'}
-            {state.currentCost && (
+            {cost && (
               <>
                 {' '}
-                · currently <strong>{money(state.currentCost.total)}</strong> ({money(state.currentCost.itemTotal)} +{' '}
-                {money(state.currentCost.shippingTotal)} shipping)
+                · currently <strong>{money(cost.total)}</strong> ({money(cost.itemTotal)} + {money(cost.shippingTotal)} shipping)
               </>
             )}
           </p>
@@ -129,8 +124,8 @@ export function CartSection({ state, actions, busy }: { state: State; actions: O
               </tr>
             </thead>
             <tbody>
-              {state.requirements.map((r) => (
-                <RequirementRow key={r.id} requirement={r} state={state} actions={actions} disabled={busy} />
+              {session.catalog.requirements.map((r) => (
+                <RequirementRow key={r.id} requirement={r} session={session} optimizer={optimizer} disabled={busy} />
               ))}
             </tbody>
           </table>

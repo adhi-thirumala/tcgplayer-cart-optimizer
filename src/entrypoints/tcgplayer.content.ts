@@ -1,9 +1,9 @@
-import { serveTcgApi } from '@/core/rpc';
-import { createTcgApi } from '@/tcgplayer/api';
+import { Effect, Layer } from 'effect';
+import { TcgServer } from '@/tcgplayer/server';
 
 export default defineContentScript({
   matches: ['*://*.tcgplayer.com/*'],
   main() {
-    serveTcgApi(createTcgApi());
+    Effect.runFork(Layer.launch(TcgServer));
   },
 });

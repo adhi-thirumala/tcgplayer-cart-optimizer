@@ -1,48 +1,50 @@
-import type { CartAddResult, Plan, Requirement } from '@/core/types';
+import type { CartAddRequest, CartAddResult, Plan } from '@/core/domain';
 import type { CartCost } from '@/solver';
 import { money } from './format';
-import type { OptimizerActions } from './useOptimizer';
+import type { Session } from './machine';
+import type { Optimizer } from './optimizer';
+
+const keyOf = (request: CartAddRequest) => `${request.sku}:${request.sellerKey}`;
 
 export function AppliedView({
   plan,
   results,
   cost,
-  requirements,
-  actions,
+  session,
+  optimizer,
 }: {
   plan: Plan;
-  results: CartAddResult[];
+  results: readonly CartAddResult[];
   cost: CartCost | null;
-  requirements: Requirement[];
-  actions: OptimizerActions;
+  session: Session;
+  optimizer: Optimizer;
 }) {
-  const failed = results.filter((r) => !r.ok || r.quantityInCart < r.request.quantity);
-  const repriced = results.filter((r) => r.ok && r.currentPrice !== null && Math.abs(r.currentPrice - r.request.price) > 0.004);
-  const labels = new Map(requirements.map((r) => [r.id, r.label]));
+  const short = results.filter((r) => r._tag === 'Rejected' || r.quantityInCart < r.request.quantity);
+  const repriced = results.flatMap((r) => (r._tag === 'Added' && Math.abs(r.currentPrice - r.request.price) > 0.004 ? [r] : []));
+  const labels = new Map(session.catalog.requirements.map((r) => [r.id, r.label]));
   const names = new Map(
-    plan.orders.flatMap((o) =>
-      o.items.map((i) => [`${i.listing.sku}:${i.listing.sellerKey}`, `${labels.get(i.requirementId) ?? 'Card'} from ${o.sellerName}`]),
-    ),
+    plan.orders.flatMap((o) => o.items.map((i) => [keyOf(i.listing), `${labels.get(i.requirementId) ?? 'Card'} from ${o.seller.name}`])),
   );
-  const describe = (r: CartAddResult) => names.get(`${r.request.sku}:${r.request.sellerKey}`) ?? `SKU ${r.request.sku}`;
+  const describe = (request: CartAddRequest) => names.get(keyOf(request)) ?? `SKU ${request.sku}`;
 
   return (
     <section className="panel" aria-labelledby="applied-title">
       <h2 id="applied-title">Cart updated</h2>
       <p role="status">
-        {failed.length === 0 ? 'Every item was added.' : `${failed.length} of ${results.length} items could not be added in full.`}{' '}
+        {short.length === 0 ? 'Every item was added.' : `${short.length} of ${results.length} items could not be added in full.`}{' '}
         {cost && (
           <>
             Your cart now costs <strong>{money(cost.total)}</strong> (planned {money(plan.total)}).
           </>
         )}
       </p>
-      {failed.length > 0 && (
+      {short.length > 0 && (
         <div className="notice warn">
           <ul>
-            {failed.map((r) => (
-              <li key={`${r.request.sku}:${r.request.sellerKey}`}>
-                {describe(r)}: {r.quantityInCart}/{r.request.quantity} added{r.error ? ` (${r.error})` : ''}
+            {short.map((r) => (
+              <li key={keyOf(r.request)}>
+                {describe(r.request)}:{' '}
+                {r._tag === 'Added' ? `${r.quantityInCart}/${r.request.quantity} added` : `not added (${r.reason})`}
               </li>
             ))}
           </ul>
@@ -54,18 +56,18 @@ export function AppliedView({
           Prices changed:
           <ul>
             {repriced.map((r) => (
-              <li key={`${r.request.sku}:${r.request.sellerKey}`}>
-                {describe(r)}: {money(r.request.price)} → {money(r.currentPrice!)}
+              <li key={keyOf(r.request)}>
+                {describe(r.request)}: {money(r.request.price)} → {money(r.currentPrice)}
               </li>
             ))}
           </ul>
         </div>
       )}
       <div className="actions">
-        <button type="button" className="primary" onClick={() => void actions.showCart()}>
+        <button type="button" className="primary" onClick={optimizer.showCart}>
           Open cart on TCGplayer
         </button>
-        <button type="button" onClick={() => void actions.reloadCart()}>
+        <button type="button" onClick={optimizer.reloadCart}>
           Optimize again
         </button>
       </div>

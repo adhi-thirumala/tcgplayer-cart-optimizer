@@ -1,10 +1,11 @@
 import { useRef } from 'react';
-import type { Plan, Requirement, SellerShipping } from '@/core/types';
-import { money, sellerUrl, shippingRule } from './format';
+import type { Plan } from '@/core/domain';
 import type { CartCost } from '@/solver';
-import type { OptimizerActions } from './useOptimizer';
+import { money, productUrl, sellerUrl, shippingRule } from './format';
+import type { Session } from './machine';
+import type { Optimizer } from './optimizer';
 
-export function PlanSummary({ plan, current }: { plan: Plan; current: CartCost | null }) {
+function PlanSummary({ plan, current }: { plan: Plan; current: CartCost | null }) {
   const savings = current ? current.total - plan.total : null;
   return (
     <dl className="summary">
@@ -32,23 +33,9 @@ export function PlanSummary({ plan, current }: { plan: Plan; current: CartCost |
   );
 }
 
-export function PlanView({
-  plan,
-  current,
-  requirements,
-  sellers,
-  actions,
-  busy,
-}: {
-  plan: Plan;
-  current: CartCost | null;
-  requirements: Requirement[];
-  sellers: Map<number, SellerShipping>;
-  actions: OptimizerActions;
-  busy: boolean;
-}) {
+export function PlanView({ plan, session, optimizer, busy }: { plan: Plan; session: Session; optimizer: Optimizer; busy: boolean }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  const labels = new Map(requirements.map((r) => [r.id, r.label]));
+  const labels = new Map(session.catalog.requirements.map((r) => [r.id, r.label]));
 
   return (
     <section className="panel" aria-labelledby="plan-title">
@@ -58,7 +45,7 @@ export function PlanView({
           Replace my cart with this
         </button>
       </div>
-      <PlanSummary plan={plan} current={current} />
+      <PlanSummary plan={plan} current={session.cost} />
       {plan.status === 'feasible' && (
         <p className="notice" role="status">
           The solver ran out of time; this is the best plan it found, not a proven optimum.
@@ -78,74 +65,62 @@ export function PlanView({
         </div>
       )}
       <ol className="orders">
-        {plan.orders.map((order) => {
-          const rule = sellers.get(order.sellerId);
-          return (
-            <li key={order.sellerId} className="order">
-              <header>
-                <a href={sellerUrl(order.sellerKey)} target="_blank" rel="noreferrer" className="seller">
-                  {order.sellerName}
-                </a>
-                {rule && (
-                  <span className="muted">
-                    {rule.rating === null ? 'unrated' : `${rule.rating}%`} · {rule.sales} sales · {shippingRule(rule)}
-                  </span>
-                )}
-                <button type="button" className="link" disabled={busy} onClick={() => void actions.excludeSeller(order.sellerKey)}>
-                  Exclude seller
-                </button>
-              </header>
-              <table>
-                <tbody>
-                  {order.items.map((item) => (
-                    <tr key={item.listing.listingId}>
-                      <td className="num">{item.quantity}×</td>
-                      <td>
-                        <a href={`https://www.tcgplayer.com/product/${item.listing.productId}`} target="_blank" rel="noreferrer">
-                          {labels.get(item.requirementId) ?? item.requirementId}
-                        </a>
-                        <span className="muted">
-                          {' '}
-                          · {item.listing.printing} · {item.listing.condition}
-                        </span>
-                      </td>
-                      <td className="num">{money(item.listing.price)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot>
-                  <tr>
-                    <td />
-                    <td>Subtotal + shipping</td>
-                    <td className="num">
-                      {money(order.subtotal)} + {order.shipping === 0 ? 'free' : money(order.shipping)}
+        {plan.orders.map(({ seller, items, subtotal, shipping }) => (
+          <li key={seller.sellerId} className="order">
+            <header>
+              <a href={sellerUrl(seller.sellerKey)} target="_blank" rel="noreferrer" className="seller">
+                {seller.name}
+              </a>
+              <span className="muted">
+                {seller.rating === null ? 'unrated' : `${seller.rating}%`} · {seller.sales} sales · {shippingRule(seller.shipping)}
+              </span>
+              <button type="button" className="link" disabled={busy} onClick={() => optimizer.excludeSeller(seller)}>
+                Exclude seller
+              </button>
+            </header>
+            <table>
+              <tbody>
+                {items.map((item) => (
+                  <tr key={item.listing.listingId}>
+                    <td className="num">{item.quantity}×</td>
+                    <td>
+                      <a href={productUrl(item.listing.productId)} target="_blank" rel="noreferrer">
+                        {labels.get(item.requirementId) ?? item.requirementId}
+                      </a>
+                      <span className="muted">
+                        {' '}
+                        · {item.listing.printing} · {item.listing.condition}
+                      </span>
                     </td>
+                    <td className="num">{money(item.listing.price)}</td>
                   </tr>
-                </tfoot>
-              </table>
-            </li>
-          );
-        })}
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td />
+                  <td>Subtotal + shipping</td>
+                  <td className="num">
+                    {money(subtotal)} + {shipping === 0 ? 'free' : money(shipping)}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </li>
+        ))}
       </ol>
       <dialog ref={dialog} className="confirm" aria-labelledby="confirm-title">
         <form method="dialog">
           <h3 id="confirm-title">Replace your cart?</h3>
           <p>
             Every item in your TCGplayer cart will be removed and replaced with{' '}
-            {plan.orders.length === 1 ? 'this package' : `these ${plan.orders.length} packages`} ({money(plan.total)}).
-            Saved-for-later items are not touched.
+            {plan.orders.length === 1 ? 'this package' : `these ${plan.orders.length} packages`} ({money(plan.total)}). Saved-for-later items stay.
           </p>
           <div className="actions">
             <button value="cancel" autoFocus>
               Cancel
             </button>
-            <button
-              value="apply"
-              className="primary"
-              onClick={() => {
-                void actions.apply(plan);
-              }}
-            >
+            <button value="apply" className="primary" onClick={() => optimizer.apply(plan)}>
               Replace cart
             </button>
           </div>

@@ -42,7 +42,7 @@ markup, optional reminder text); `src/catalog` normalizes before comparing.
 
 ## Product details
 
-`GET https://mp-search-api.tcgplayer.com/v1/product/<productId>/details` — **no envelope**; the
+`GET https://mp-search-api.tcgplayer.com/v1/product/<productId>/details` returns **no envelope**, just the
 same fields as a search result (`listings` instead of `totalListings`).
 
 ## Products for SKUs
@@ -88,7 +88,7 @@ charge the same price over the threshold (no free shipping).
 ## Cart
 
 Cart key: cookie `StoreCart_PRODUCTION=CK=<32 hex>&Ignore=false`. It is a session cookie for
-guests, is created by visiting the cart page, and changes when the user signs in — always re-read it.
+guests, is created by visiting the cart page, and changes when the user signs in, so read it before every cart call.
 
 | Purpose | Request | Notes |
 | --- | --- | --- |

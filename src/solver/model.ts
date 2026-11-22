@@ -3,17 +3,20 @@ import type {
   CartLine,
   Listing,
   Plan,
+  PlanItem,
   PlanOrder,
+  ProductId,
   Requirement,
-  SellerShipping,
-  Shortfall,
+  Seller,
+  SellerId,
+  ShippingRule,
   SolveInput,
-} from '@/core/types';
+} from '@/core/domain';
 
 /**
  * MILP: choose listing quantities covering every requirement while minimising
  * item cost plus each used seller's shipping, where shipping drops from
- * `priceUnder` to `priceOver` once that seller's subtotal reaches its threshold.
+ * `under` to `over` once that seller's subtotal reaches its threshold.
  *
  *   x_i ∈ ℤ, 0 ≤ x_i ≤ min(listing qty, requirement qty)   units bought from listing i
  *   y_s ∈ {0,1}                                             seller s ships a package
@@ -23,56 +26,58 @@ import type {
  *   min Σ p_i x_i + Σ_s (under_s y_s − (under_s − over_s) z_s) + M Σ m_r
  *   s.t. Σ_{i∈r} x_i + m_r = q_r          ∀ r
  *        x_i ≤ q_{r(i)} · y_{s(i)}         ∀ i
- *        Σ_{i∈s} p_i x_i ≥ T_s · z_s       ∀ s with a discount
+ *        Σ_{i∈s} p_i x_i ≥ T_s · z_s       ∀ s with a threshold
  *        z_s ≤ y_s
  *        Σ y_s ≤ maxPackages               (optional)
  *
  * The shortfall penalty M exceeds any achievable purchase cost, so m_r is
- * non-zero only when supply genuinely runs out.
+ * non-zero only when supply runs out.
  */
 
 export interface BuiltModel {
-  lp: string;
+  readonly lp: string;
   /** Column `x{i}` buys `listings[i]` for requirement `listingReq[i]`. */
-  listings: Listing[];
-  listingReq: number[];
+  readonly listings: readonly Listing[];
+  readonly listingReq: readonly number[];
   /** Columns `y{j}` / `z{j}` belong to `sellers[j]`. */
-  sellers: SellerShipping[];
+  readonly sellers: readonly Seller[];
   /** Column `m{k}` is the shortfall of `requirements[k]`. */
-  requirements: Requirement[];
+  readonly requirements: readonly Requirement[];
 }
 
 const EPS = 1e-6;
 
-export function cents(amount: number): number {
-  return Math.round(amount * 100);
-}
-
-function money(amount: number): number {
-  return cents(amount) / 100;
-}
+const cents = (amount: number) => Math.round(amount * 100);
+const money = (amount: number) => cents(amount) / 100;
 
 /** Shipping a seller charges for an order with this item subtotal. */
-export function shippingFor(rule: SellerShipping, subtotal: number): number {
-  if (rule.thresholdPrice !== null && cents(subtotal) >= cents(rule.thresholdPrice)) {
-    return rule.priceOver;
+export function shippingFor(rule: ShippingRule, subtotal: number): number {
+  switch (rule._tag) {
+    case 'Flat':
+      return rule.price;
+    case 'Threshold':
+      return cents(subtotal) >= cents(rule.threshold) ? rule.over : rule.under;
   }
-  return rule.priceUnder;
 }
 
-function discount(rule: SellerShipping): number {
-  return rule.thresholdPrice === null ? 0 : Math.max(0, rule.priceUnder - rule.priceOver);
+/** Shipping below any threshold: the price of a package. */
+function packagePrice(rule: ShippingRule): number {
+  return rule._tag === 'Flat' ? rule.price : rule.under;
+}
+
+function discount(rule: ShippingRule): number {
+  return rule._tag === 'Flat' ? 0 : rule.under - rule.over;
 }
 
 interface Group {
-  k: number;
-  rule: SellerShipping;
+  readonly k: number;
+  seller: Seller;
   /** Ascending by price. */
-  listings: Listing[];
+  readonly listings: Listing[];
 }
 
 /** Cheapest total for `units` copies from price-sorted listings; null when stock runs out. */
-function cheapestUnits(listings: Listing[], units: number): number | null {
+function cheapestUnits(listings: readonly Listing[], units: number): number | null {
   let total = 0;
   let left = units;
   for (const l of listings) {
@@ -98,32 +103,27 @@ function cheapestUnits(listings: Listing[], units: number): number | null {
  *    and taking the u copies there instead costs no more and affects nothing
  *    else (the seller sells nothing other than r; the package count is equal).
  * 3. A flat-rate seller s is dominated by seller t when t charges no more
- *    shipping (t.priceUnder ≤ s.priceUnder) and, for every requirement s
- *    offers and every unit count, t sells those copies for no more. Whatever
- *    the optimum buys from s, t could supply for no more. A solution has at
- *    most P packages (P = total copies needed, or maxPackages), so if s has
- *    ≥ P dominators one of them is idle and can take over s's order. Ties are
- *    broken by seller id so the relation is acyclic and a chain of such
- *    swaps always ends at a seller that is kept.
+ *    for a package and, for every requirement s offers and every unit count,
+ *    t sells those copies for no more. Whatever the optimum buys from s, t
+ *    could supply for no more. A solution has at most P packages (P = total
+ *    copies needed, or maxPackages), so if s has ≥ P dominators one of them is
+ *    idle and can take over s's order. Ties are broken by seller id so the
+ *    relation is acyclic and a chain of such swaps always ends at a seller
+ *    that is kept.
  */
-function reduceGroups(groups: Group[], requirements: Requirement[], maxPackages: number | null): Group[] {
-  const bySeller = new Map<number, Group[]>();
-  for (const g of groups) {
-    const list = bySeller.get(g.rule.sellerId);
-    if (list) list.push(g);
-    else bySeller.set(g.rule.sellerId, [g]);
-  }
+function reduceGroups(groups: Group[], requirements: readonly Requirement[], maxPackages: number | null): Group[] {
+  const bySeller = Map.groupBy(groups, (g) => g.seller.sellerId);
 
   for (const list of bySeller.values()) {
-    const rule = list[0]!.rule;
-    if (discount(rule) <= 0) continue;
+    const { shipping } = list[0]!.seller;
+    if (shipping._tag === 'Flat') continue;
     const reachable = list.reduce((sum, g) => {
       const q = requirements[g.k]!.quantity;
-      return sum + (cheapestUnits([...g.listings].reverse(), q) ?? g.listings.reduce((s, l) => s + l.price * l.quantity, 0));
+      return sum + (cheapestUnits(g.listings.toReversed(), q) ?? g.listings.reduce((s, l) => s + l.price * l.quantity, 0));
     }, 0);
-    if (cents(reachable) < cents(rule.thresholdPrice!)) {
-      const flat = { ...rule, thresholdPrice: null };
-      for (const g of list) g.rule = flat;
+    if (cents(reachable) < cents(shipping.threshold)) {
+      const flat: Seller = { ...list[0]!.seller, shipping: { _tag: 'Flat', price: shipping.under } };
+      for (const g of list) g.seller = flat;
     }
   }
 
@@ -133,9 +133,7 @@ function reduceGroups(groups: Group[], requirements: Requirement[], maxPackages:
     if (list.length > 1) kept.push(...list);
     else {
       const g = list[0]!;
-      const same = singles.get(g.k);
-      if (same) same.push(g);
-      else singles.set(g.k, [g]);
+      singles.set(g.k, [...(singles.get(g.k) ?? []), g]);
     }
   }
 
@@ -146,8 +144,9 @@ function reduceGroups(groups: Group[], requirements: Requirement[], maxPackages:
       const bounds = candidates.flatMap((g) => {
         const cost = cheapestUnits(g.listings, units);
         if (cost === null) return [];
-        const ub = cost + shippingFor(g.rule, cost);
-        const lb = discount(g.rule) > 0 ? Math.min(ub, Math.max(cost, g.rule.thresholdPrice!) + g.rule.priceOver) : ub;
+        const rule = g.seller.shipping;
+        const ub = cost + shippingFor(rule, cost);
+        const lb = rule._tag === 'Threshold' ? Math.min(ub, Math.max(cost, rule.threshold) + rule.over) : ub;
         return [{ g, ub, lb }];
       });
       const qthBest = bounds.map((b) => b.ub).sort((a, b) => a - b)[q - 1] ?? Infinity;
@@ -164,13 +163,16 @@ function reduceGroups(groups: Group[], requirements: Requirement[], maxPackages:
  * cheapest conceivable package, and the optimum costs no more than a greedy
  * plan, so packages ≤ greedy / cheapest. Also ≤ copies needed and maxPackages.
  */
-function packageBound(groups: Group[], requirements: Requirement[], maxPackages: number | null): number {
-  let bound = Math.min(requirements.reduce((sum, r) => sum + r.quantity, 0), maxPackages ?? Infinity);
+function packageBound(groups: readonly Group[], requirements: readonly Requirement[], maxPackages: number | null): number {
+  let bound = Math.min(
+    requirements.reduce((sum, r) => sum + r.quantity, 0),
+    maxPackages ?? Infinity,
+  );
   let cheapestPackage = Infinity;
   for (const g of groups) {
-    const r = g.rule;
-    const viaThreshold = discount(r) > 0 ? r.thresholdPrice! + r.priceOver : Infinity;
-    cheapestPackage = Math.min(cheapestPackage, g.listings[0]!.price + r.priceUnder, viaThreshold);
+    const rule = g.seller.shipping;
+    const viaThreshold = rule._tag === 'Threshold' ? rule.threshold + rule.over : Infinity;
+    cheapestPackage = Math.min(cheapestPackage, g.listings[0]!.price + packagePrice(rule), viaThreshold);
   }
   const greedy = greedyCost(groups, requirements);
   if (cheapestPackage > EPS && Number.isFinite(greedy)) {
@@ -180,18 +182,16 @@ function packageBound(groups: Group[], requirements: Requirement[], maxPackages:
 }
 
 /** Cost of a greedy plan: fill each requirement from the best marginal cost per copy. Infinity if infeasible. */
-function greedyCost(groups: Group[], requirements: Requirement[]): number {
-  const byReq = requirements.map(() => [] as Group[]);
-  for (const g of groups) byReq[g.k]!.push(g);
+function greedyCost(groups: readonly Group[], requirements: readonly Requirement[]): number {
+  const byReq = Map.groupBy(groups, (g) => g.k);
   const used = new Map<Group, number>();
-  const subtotal = new Map<number, number>();
-  const rule = new Map<number, SellerShipping>();
+  const orders = new Map<SellerId, { rule: ShippingRule; subtotal: number }>();
 
   for (const [k, requirement] of requirements.entries()) {
     let left = requirement.quantity;
     while (left > 0) {
       let best: { g: Group; units: number; cost: number; perUnit: number } | null = null;
-      for (const g of byReq[k]!) {
+      for (const g of byReq.get(k) ?? []) {
         let skip = used.get(g) ?? 0;
         let units = 0;
         let cost = 0;
@@ -204,39 +204,40 @@ function greedyCost(groups: Group[], requirements: Requirement[]): number {
           if (units === left) break;
         }
         if (units === 0) continue;
-        const before = subtotal.get(g.rule.sellerId);
-        const marginal =
-          cost + shippingFor(g.rule, (before ?? 0) + cost) - (before === undefined ? 0 : shippingFor(g.rule, before));
+        const before = orders.get(g.seller.sellerId)?.subtotal;
+        const rule = g.seller.shipping;
+        const marginal = cost + shippingFor(rule, (before ?? 0) + cost) - (before === undefined ? 0 : shippingFor(rule, before));
         if (!best || marginal / units < best.perUnit) best = { g, units, cost, perUnit: marginal / units };
       }
       if (!best) return Infinity;
       used.set(best.g, (used.get(best.g) ?? 0) + best.units);
-      subtotal.set(best.g.rule.sellerId, (subtotal.get(best.g.rule.sellerId) ?? 0) + best.cost);
-      rule.set(best.g.rule.sellerId, best.g.rule);
+      const order = orders.get(best.g.seller.sellerId);
+      orders.set(best.g.seller.sellerId, { rule: best.g.seller.shipping, subtotal: (order?.subtotal ?? 0) + best.cost });
       left -= best.units;
     }
   }
   let total = 0;
-  for (const [sellerId, sub] of subtotal) total += sub + shippingFor(rule.get(sellerId)!, sub);
+  for (const { rule, subtotal } of orders.values()) total += subtotal + shippingFor(rule, subtotal);
   return total;
 }
 
 interface Offer {
-  sellerId: number;
-  under: number;
-  flat: boolean;
+  readonly sellerId: SellerId;
+  readonly packagePrice: number;
+  readonly flat: boolean;
   /** requirement index → cost[u-1] of the cheapest u copies, u ≤ min(need, stock). */
-  costs: Map<number, number[]>;
-  groups: Group[];
+  readonly costs: Map<number, number[]>;
+  readonly groups: Group[];
 }
 
-function dropDominatedFlatSellers(groups: Group[], requirements: Requirement[], packages: number): Group[] {
-  const offers = new Map<number, Offer>();
+function dropDominatedFlatSellers(groups: readonly Group[], requirements: readonly Requirement[], packages: number): Group[] {
+  const offers = new Map<SellerId, Offer>();
   for (const g of groups) {
-    let offer = offers.get(g.rule.sellerId);
+    let offer = offers.get(g.seller.sellerId);
     if (!offer) {
-      offer = { sellerId: g.rule.sellerId, under: g.rule.priceUnder, flat: discount(g.rule) <= 0, costs: new Map(), groups: [] };
-      offers.set(g.rule.sellerId, offer);
+      const rule = g.seller.shipping;
+      offer = { sellerId: g.seller.sellerId, packagePrice: packagePrice(rule), flat: rule._tag === 'Flat', costs: new Map(), groups: [] };
+      offers.set(g.seller.sellerId, offer);
     }
     const costs: number[] = [];
     for (let u = 1; u <= requirements[g.k]!.quantity; u++) {
@@ -250,22 +251,19 @@ function dropDominatedFlatSellers(groups: Group[], requirements: Requirement[], 
 
   const byReq = new Map<number, Offer[]>();
   for (const offer of offers.values()) {
-    for (const k of offer.costs.keys()) {
-      const list = byReq.get(k);
-      if (list) list.push(offer);
-      else byReq.set(k, [offer]);
-    }
+    for (const k of offer.costs.keys()) byReq.set(k, [...(byReq.get(k) ?? []), offer]);
   }
 
   const dominates = (t: Offer, s: Offer): boolean => {
-    if (t === s || t.under > s.under + EPS) return false;
-    let strictly = t.under < s.under - EPS;
+    if (t === s || t.packagePrice > s.packagePrice + EPS) return false;
+    let strictly = t.packagePrice < s.packagePrice - EPS;
     for (const [k, sCosts] of s.costs) {
       const tCosts = t.costs.get(k);
       if (!tCosts || tCosts.length < sCosts.length) return false;
-      for (let u = 0; u < sCosts.length; u++) {
-        if (tCosts[u]! > sCosts[u]! + EPS) return false;
-        if (tCosts[u]! < sCosts[u]! - EPS) strictly = true;
+      for (const [u, sCost] of sCosts.entries()) {
+        const tCost = tCosts[u]!;
+        if (tCost > sCost + EPS) return false;
+        if (tCost < sCost - EPS) strictly = true;
       }
     }
     return strictly || t.sellerId < s.sellerId;
@@ -276,9 +274,7 @@ function dropDominatedFlatSellers(groups: Group[], requirements: Requirement[], 
     let dominators = 0;
     if (s.flat) {
       // Any dominator must stock every requirement s does; scan the rarest one's sellers.
-      const scan = [...s.costs.keys()]
-        .map((k) => byReq.get(k)!)
-        .reduce((a, b) => (b.length < a.length ? b : a));
+      const scan = [...s.costs.keys()].map((k) => byReq.get(k)!).reduce((a, b) => (b.length < a.length ? b : a));
       for (const t of scan) {
         if (dominates(t, s) && ++dominators >= packages) break;
       }
@@ -296,7 +292,7 @@ function dropDominatedFlatSellers(groups: Group[], requirements: Requirement[], 
  * is dominated: moving that unit onto a kept listing with spare capacity
  * lowers the subtotal by at least the discount, all the shipping it could cost.
  */
-function prune({ listings, rule }: Group, quantity: number): Listing[] {
+function prune({ listings, seller }: Group, quantity: number): Listing[] {
   const kept: Listing[] = [];
   let covered = 0;
   for (const listing of listings) {
@@ -305,7 +301,7 @@ function prune({ listings, rule }: Group, quantity: number): Listing[] {
       covered += listing.quantity;
       continue;
     }
-    const ceiling = kept[kept.length - 1]!.price + discount(rule);
+    const ceiling = kept[kept.length - 1]!.price + discount(seller.shipping);
     if (listing.price < ceiling - EPS) kept.push(listing);
     else break;
   }
@@ -313,7 +309,7 @@ function prune({ listings, rule }: Group, quantity: number): Listing[] {
 }
 
 /** LP-format linear expression, wrapped so no line gets unreasonably long. */
-function expr(terms: Array<[number, string]>): string {
+function expr(terms: ReadonlyArray<readonly [number, string]>): string {
   const parts = terms
     .filter(([c]) => Math.abs(c) > EPS)
     .map(([c, v], i) => {
@@ -325,51 +321,58 @@ function expr(terms: Array<[number, string]>): string {
   return lines.join('\n   ');
 }
 
+function chunk(names: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < names.length; i += 16) out.push(` ${names.slice(i, i + 16).join(' ')}`);
+  return out;
+}
+
+/** Null when nothing is needed. Throws when two requirements share a product. */
 export function buildModel(input: SolveInput): BuiltModel | null {
   const { options } = input;
   const requirements = input.requirements.filter((r) => r.quantity > 0);
   if (requirements.length === 0) return null;
 
-  const reqOfProduct = new Map<number, number>();
-  requirements.forEach((r, k) => {
+  const reqOfProduct = new Map<ProductId, number>();
+  for (const [k, r] of requirements.entries()) {
     for (const productId of r.candidates) {
-      if (reqOfProduct.has(productId)) {
-        throw new Error(`Product ${productId} belongs to more than one requirement`);
-      }
+      if (reqOfProduct.has(productId)) throw new Error(`Product ${productId} belongs to more than one requirement`);
       reqOfProduct.set(productId, k);
     }
-  });
+  }
 
-  const rules = new Map(input.sellers.map((s) => [s.sellerId, s]));
-  const excluded = new Set(options.excludeSellerKeys);
+  const sellersById = new Map(input.sellers.map((s) => [s.sellerId, s]));
+  const excluded = new Set(options.excludedSellers.map((s) => s.key));
   const conditions = new Set(options.conditions);
-  const sellerAllowed = (rule: SellerShipping | undefined): rule is SellerShipping =>
-    rule !== undefined &&
-    !excluded.has(rule.sellerKey) &&
-    (options.minSellerRating <= 0 || (rule.rating ?? -1) >= options.minSellerRating);
-
   const groups = new Map<string, Group>();
   for (const listing of input.listings) {
     const k = reqOfProduct.get(listing.productId);
-    const rule = rules.get(listing.sellerId);
-    if (k === undefined || listing.quantity <= 0 || !conditions.has(listing.condition) || !sellerAllowed(rule)) {
+    const seller = sellersById.get(listing.sellerId);
+    if (
+      k === undefined ||
+      seller === undefined ||
+      listing.quantity <= 0 ||
+      !conditions.has(listing.condition) ||
+      excluded.has(seller.sellerKey) ||
+      (options.minSellerRating > 0 && (seller.rating ?? -1) < options.minSellerRating)
+    ) {
       continue;
     }
     const key = `${listing.sellerId}:${k}`;
     let group = groups.get(key);
-    if (!group) groups.set(key, (group = { k, rule, listings: [] }));
+    if (!group) groups.set(key, (group = { k, seller, listings: [] }));
     group.listings.push(listing);
   }
   for (const g of groups.values()) g.listings.sort((a, b) => a.price - b.price || a.listingId - b.listingId);
 
   const listings: Listing[] = [];
   const listingReq: number[] = [];
-  const sellerIndex = new Map<number, number>();
-  const sellers: SellerShipping[] = [];
+  const sellerIndex = new Map<SellerId, number>();
+  const sellers: Seller[] = [];
   for (const group of reduceGroups([...groups.values()], requirements, options.maxPackages)) {
-    if (!sellerIndex.has(group.rule.sellerId)) {
-      sellerIndex.set(group.rule.sellerId, sellers.length);
-      sellers.push(group.rule);
+    if (!sellerIndex.has(group.seller.sellerId)) {
+      sellerIndex.set(group.seller.sellerId, sellers.length);
+      sellers.push(group.seller);
     }
     for (const listing of prune(group, requirements[group.k]!.quantity)) {
       listings.push(listing);
@@ -381,11 +384,11 @@ export function buildModel(input: SolveInput): BuiltModel | null {
   const penalty = 1000 + 1000 * maxPrice;
 
   const objective: Array<[number, string]> = listings.map((l, i) => [l.price, `x${i}`]);
-  sellers.forEach((s, j) => {
-    objective.push([s.priceUnder, `y${j}`]);
-    if (discount(s) > 0) objective.push([-discount(s), `z${j}`]);
-  });
-  requirements.forEach((_, k) => objective.push([penalty, `m${k}`]));
+  for (const [j, s] of sellers.entries()) {
+    objective.push([packagePrice(s.shipping), `y${j}`]);
+    if (s.shipping._tag === 'Threshold') objective.push([-discount(s.shipping), `z${j}`]);
+  }
+  for (const k of requirements.keys()) objective.push([penalty, `m${k}`]);
 
   // x_i ≤ cap_i · y_s with cap_i = min(listing qty, need) rather than a loose big-M:
   // most listings hold one or two copies, so the LP relaxation pays (nearly) full
@@ -394,27 +397,26 @@ export function buildModel(input: SolveInput): BuiltModel | null {
   const rows: string[] = [];
   const byReq: Array<Array<[number, string]>> = requirements.map(() => []);
   const bySeller: Array<Array<[number, string]>> = sellers.map(() => []);
-  listings.forEach((l, i) => {
-    const k = listingReq[i]!;
+  for (const [i, l] of listings.entries()) {
     const j = sellerIndex.get(l.sellerId)!;
-    byReq[k]!.push([1, `x${i}`]);
+    byReq[listingReq[i]!]!.push([1, `x${i}`]);
     bySeller[j]!.push([l.price, `x${i}`]);
     rows.push(` link${i}: ${expr([[1, `x${i}`], [-cap[i]!, `y${j}`]])} <= 0`);
-  });
-  requirements.forEach((r, k) => {
+  }
+  for (const [k, r] of requirements.entries()) {
     rows.push(` need${k}: ${expr([...byReq[k]!, [1, `m${k}`]])} = ${r.quantity}`);
-  });
-  sellers.forEach((s, j) => {
-    if (discount(s) <= 0) return;
-    rows.push(` free${j}: ${expr([...bySeller[j]!, [-s.thresholdPrice!, `z${j}`]])} >= 0`);
+  }
+  for (const [j, s] of sellers.entries()) {
+    if (s.shipping._tag === 'Flat') continue;
+    rows.push(` free${j}: ${expr([...bySeller[j]!, [-s.shipping.threshold, `z${j}`]])} >= 0`);
     rows.push(` ship${j}: ${expr([[1, `z${j}`], [-1, `y${j}`]])} <= 0`);
-  });
+  }
   if (options.maxPackages !== null && sellers.length > 0) {
     rows.push(` packages: ${expr(sellers.map((_, j) => [1, `y${j}`]))} <= ${options.maxPackages}`);
   }
 
   const bounds = listings.map((_, i) => ` 0 <= x${i} <= ${cap[i]}`);
-  const binaries = sellers.flatMap((s, j) => (discount(s) > 0 ? [`y${j}`, `z${j}`] : [`y${j}`]));
+  const binaries = sellers.flatMap((s, j) => (s.shipping._tag === 'Threshold' ? [`y${j}`, `z${j}`] : [`y${j}`]));
   const generals = [...listings.map((_, i) => `x${i}`), ...requirements.map((_, k) => `m${k}`)];
 
   const lp = [
@@ -434,94 +436,66 @@ export function buildModel(input: SolveInput): BuiltModel | null {
   return { lp, listings, listingReq, sellers, requirements };
 }
 
-function chunk(names: string[]): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < names.length; i += 16) out.push(` ${names.slice(i, i + 16).join(' ')}`);
-  return out;
-}
-
-/** Turn column values into a self-consistent plan (shipping recomputed from subtotals). */
-export function decodePlan(
-  model: BuiltModel,
-  value: (column: string) => number,
-  status: Plan['status'],
-): Plan {
-  const orders = new Map<number, PlanOrder>();
-  model.listings.forEach((listing, i) => {
+/** Turns column values into a self-consistent plan, with shipping recomputed from subtotals. */
+export function decodePlan(model: BuiltModel, value: (column: string) => number, status: Plan['status']): Plan {
+  const items = new Map<SellerId, PlanItem[]>();
+  for (const [i, listing] of model.listings.entries()) {
     const quantity = Math.round(value(`x${i}`));
-    if (quantity <= 0) return;
-    let order = orders.get(listing.sellerId);
-    if (!order) {
-      order = {
-        sellerId: listing.sellerId,
-        sellerKey: listing.sellerKey,
-        sellerName: listing.sellerName,
-        items: [],
-        subtotal: 0,
-        shipping: 0,
-      };
-      orders.set(listing.sellerId, order);
-    }
-    order.items.push({ requirementId: model.requirements[model.listingReq[i]!]!.id, listing, quantity });
-  });
-
-  const rules = new Map(model.sellers.map((s) => [s.sellerId, s]));
-  for (const order of orders.values()) {
-    order.subtotal = money(order.items.reduce((sum, it) => sum + it.listing.price * it.quantity, 0));
-    order.shipping = shippingFor(rules.get(order.sellerId)!, order.subtotal);
+    if (quantity <= 0) continue;
+    const item = { requirementId: model.requirements[model.listingReq[i]!]!.id, listing, quantity };
+    items.set(listing.sellerId, [...(items.get(listing.sellerId) ?? []), item]);
   }
 
-  const shortfall: Shortfall[] = model.requirements.flatMap((r, k) => {
+  const orders = model.sellers
+    .flatMap((seller): PlanOrder[] => {
+      const sellerItems = items.get(seller.sellerId);
+      if (!sellerItems) return [];
+      const subtotal = money(sellerItems.reduce((sum, it) => sum + it.listing.price * it.quantity, 0));
+      return [{ seller, items: sellerItems, subtotal, shipping: shippingFor(seller.shipping, subtotal) }];
+    })
+    .sort((a, b) => b.subtotal - a.subtotal);
+
+  const shortfall = model.requirements.flatMap((r, k) => {
     const missing = Math.round(value(`m${k}`));
     return missing > 0 ? [{ requirementId: r.id, missing }] : [];
   });
 
-  const list = [...orders.values()].sort((a, b) => b.subtotal - a.subtotal);
-  const itemTotal = money(list.reduce((s, o) => s + o.subtotal, 0));
-  const shippingTotal = money(list.reduce((s, o) => s + o.shipping, 0));
-  return { status, orders: list, itemTotal, shippingTotal, total: money(itemTotal + shippingTotal), shortfall };
+  const itemTotal = money(orders.reduce((s, o) => s + o.subtotal, 0));
+  const shippingTotal = money(orders.reduce((s, o) => s + o.shipping, 0));
+  return { status, orders, itemTotal, shippingTotal, total: money(itemTotal + shippingTotal), shortfall };
 }
 
-export function emptyPlan(): Plan {
-  return { status: 'optimal', orders: [], itemTotal: 0, shippingTotal: 0, total: 0, shortfall: [] };
-}
+export const EMPTY_PLAN: Plan = { status: 'optimal', orders: [], itemTotal: 0, shippingTotal: 0, total: 0, shortfall: [] };
 
 export interface CartCost {
-  itemTotal: number;
-  shippingTotal: number;
-  total: number;
+  readonly itemTotal: number;
+  readonly shippingTotal: number;
+  readonly total: number;
 }
 
-/** What the cart currently costs, using each seller's live shipping rule. */
-export function evaluateCart(lines: CartLine[], sellers: SellerShipping[]): CartCost {
-  const rules = new Map(sellers.map((s) => [s.sellerId, s]));
-  const subtotals = new Map<number, number>();
-  for (const line of lines) {
-    subtotals.set(line.sellerId, (subtotals.get(line.sellerId) ?? 0) + line.price * line.quantity);
-  }
+/** What the cart costs under each seller's live shipping rule; null when a cart seller has no rule. */
+export function evaluateCart(lines: readonly CartLine[], sellers: ReadonlyMap<SellerId, Seller>): CartCost | null {
+  const subtotals = new Map<SellerId, number>();
+  for (const line of lines) subtotals.set(line.sellerId, (subtotals.get(line.sellerId) ?? 0) + line.price * line.quantity);
   let itemTotal = 0;
   let shippingTotal = 0;
   for (const [sellerId, subtotal] of subtotals) {
-    const rule = rules.get(sellerId);
-    if (!rule) {
-      const name = lines.find((l) => l.sellerId === sellerId)?.sellerName ?? String(sellerId);
-      throw new Error(`No shipping rule for seller ${name}`);
-    }
+    const seller = sellers.get(sellerId);
+    if (!seller) return null;
     itemTotal += subtotal;
-    shippingTotal += shippingFor(rule, money(subtotal));
+    shippingTotal += shippingFor(seller.shipping, money(subtotal));
   }
   return { itemTotal: money(itemTotal), shippingTotal: money(shippingTotal), total: money(itemTotal + shippingTotal) };
 }
 
-/** Cart additions for a plan; units of the same SKU from the same seller are merged. */
+/** Cart additions for a plan, merging units of one SKU from one seller. */
 export function planToCartAdds(plan: Plan): CartAddRequest[] {
   const adds = new Map<string, CartAddRequest>();
   for (const order of plan.orders) {
     for (const { listing, quantity } of order.items) {
       const key = `${listing.sku}:${listing.sellerKey}`;
       const existing = adds.get(key);
-      if (existing) existing.quantity += quantity;
-      else adds.set(key, { sku: listing.sku, sellerKey: listing.sellerKey, price: listing.price, quantity });
+      adds.set(key, existing ? { ...existing, quantity: existing.quantity + quantity } : { sku: listing.sku, sellerKey: listing.sellerKey, price: listing.price, quantity });
     }
   }
   return [...adds.values()];

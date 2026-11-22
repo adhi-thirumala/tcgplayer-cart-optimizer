@@ -1,18 +1,9 @@
-import { CONDITIONS, type SolveOptions } from '@/core/types';
-import type { OptimizerActions } from './useOptimizer';
+import { Array as Arr } from 'effect';
+import { CONDITIONS, type SolveOptions } from '@/core/domain';
+import type { Optimizer } from './optimizer';
 
-export function OptionsPanel({
-  options,
-  sellerNames,
-  actions,
-  disabled,
-}: {
-  options: SolveOptions;
-  sellerNames: Map<string, string>;
-  actions: OptimizerActions;
-  disabled: boolean;
-}) {
-  const update = (patch: Partial<SolveOptions>) => void actions.setOptions({ ...options, ...patch });
+export function OptionsPanel({ options, optimizer, disabled }: { options: SolveOptions; optimizer: Optimizer; disabled: boolean }) {
+  const update = (patch: Partial<SolveOptions>) => optimizer.setOptions({ ...options, ...patch });
 
   return (
     <section className="panel" aria-labelledby="options-title">
@@ -53,25 +44,25 @@ export function OptionsPanel({
                   const next = e.currentTarget.checked
                     ? CONDITIONS.filter((c) => c === condition || options.conditions.includes(c))
                     : options.conditions.filter((c) => c !== condition);
-                  if (next.length > 0) update({ conditions: next });
+                  if (Arr.isReadonlyArrayNonEmpty(next)) update({ conditions: next });
                 }}
               />
               {condition}
             </label>
           ))}
         </fieldset>
-        {options.excludeSellerKeys.length > 0 && (
+        {options.excludedSellers.length > 0 && (
           <div className="excluded">
             <span>Excluded sellers:</span>
-            {options.excludeSellerKeys.map((key) => (
+            {options.excludedSellers.map((seller) => (
               <button
-                key={key}
+                key={seller.key}
                 type="button"
                 className="chip"
-                aria-label={`Allow ${sellerNames.get(key) ?? key} again`}
-                onClick={() => update({ excludeSellerKeys: options.excludeSellerKeys.filter((k) => k !== key) })}
+                aria-label={`Allow ${seller.name} again`}
+                onClick={() => update({ excludedSellers: options.excludedSellers.filter((s) => s.key !== seller.key) })}
               >
-                {sellerNames.get(key) ?? key} ×
+                {seller.name} ×
               </button>
             ))}
           </div>

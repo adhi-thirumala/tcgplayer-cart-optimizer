@@ -1,16 +1,16 @@
 import { useEffect, useState } from 'react';
-import type { OptimizerActions } from './useOptimizer';
+import type { Optimizer } from './optimizer';
 
-export function TabPicker({ reason, actions }: { reason: string; actions: OptimizerActions }) {
+export function TabPicker({ reason, optimizer }: { reason: string; optimizer: Optimizer }) {
   const [tabs, setTabs] = useState<Browser.tabs.Tab[] | null>(null);
 
   useEffect(() => {
     let live = true;
-    void actions.findTabs().then((found) => live && setTabs(found));
+    void optimizer.findTabs().then((found) => live && setTabs(found));
     return () => {
       live = false;
     };
-  }, [actions]);
+  }, [optimizer]);
 
   return (
     <section className="panel" aria-labelledby="tab-picker-title">
@@ -25,15 +25,14 @@ export function TabPicker({ reason, actions }: { reason: string; actions: Optimi
           {tabs.map((tab) => (
             <li key={tab.id}>
               <span className="tab-title">{tab.title || tab.url}</span>
-              {/* Reloading injects the content script into tabs opened before install. */}
-              <button type="button" onClick={() => tab.id !== undefined && void actions.connect(tab.id, true)}>
+              <button type="button" onClick={() => tab.id !== undefined && optimizer.connect(tab.id, true)}>
                 Use this tab
               </button>
             </li>
           ))}
         </ul>
       )}
-      <button type="button" className="primary" onClick={() => void actions.openCartTab()}>
+      <button type="button" className="primary" onClick={optimizer.openCartTab}>
         Open TCGplayer cart
       </button>
     </section>

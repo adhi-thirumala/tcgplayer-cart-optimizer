@@ -1,6 +1,5 @@
 import { defineConfig } from 'wxt';
 
-// https://wxt.dev/api/config.html
 export default defineConfig({
   srcDir: 'src',
   modules: ['@wxt-dev/module-react'],
@@ -8,9 +7,9 @@ export default defineConfig({
     name: 'TCGplayer Cart Optimizer',
     description:
       'Rebuild your TCGplayer cart for the lowest total price, including each seller’s free-shipping threshold.',
-    permissions: ['storage'],
+    // Chrome solves in an offscreen document; Firefox's background page can start the solver worker itself.
+    permissions: browser === 'firefox' ? ['storage'] : ['storage', 'offscreen'],
     host_permissions: ['*://*.tcgplayer.com/*'],
-    action: { default_title: 'Optimize TCGplayer cart' },
     // The MILP solver (HiGHS) is WebAssembly bundled with the extension.
     content_security_policy: {
       extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",

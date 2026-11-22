@@ -1,17 +1,22 @@
+import { Effect, Option, Schema } from 'effect';
 import { storage } from '#imports';
-import { CONDITIONS, DEFAULT_SOLVE_OPTIONS, type ProductId, type SolveOptions } from '@/core/types';
+import { DEFAULT_SOLVE_OPTIONS, ProductId, SolveOptions } from '@/core/domain';
 
 /** Products the user locked to the exact printing in their cart. */
-export const pinnedProducts = storage.defineItem<ProductId[]>('local:pinnedProducts', { fallback: [] });
+const pinnedProducts = storage.defineItem<unknown>('local:pinnedProducts');
+const solveOptions = storage.defineItem<unknown>('local:solveOptions');
 
-/** Solver options, minus the time limit (not user-facing). */
-export const solveOptions = storage.defineItem<SolveOptions>('local:solveOptions', {
-  fallback: DEFAULT_SOLVE_OPTIONS,
-});
+const Pins = Schema.Array(ProductId);
 
-/** Stored options merged over defaults so options added in later versions get sane values. */
-export async function loadSolveOptions(): Promise<SolveOptions> {
-  const stored = { ...DEFAULT_SOLVE_OPTIONS, ...(await solveOptions.getValue()) };
-  const conditions = stored.conditions.filter((c) => CONDITIONS.includes(c));
-  return { ...stored, conditions: conditions.length > 0 ? conditions : DEFAULT_SOLVE_OPTIONS.conditions };
-}
+/** Stored values from an older version that no longer decode fall back to the defaults. */
+export const loadPins = Effect.promise(() => pinnedProducts.getValue()).pipe(
+  Effect.map((stored) => new Set(Schema.decodeUnknownOption(Pins)(stored).pipe(Option.getOrElse(() => [])))),
+);
+
+export const loadOptions = Effect.promise(() => solveOptions.getValue()).pipe(
+  Effect.map((stored) => Schema.decodeUnknownOption(SolveOptions)(stored).pipe(Option.getOrElse(() => DEFAULT_SOLVE_OPTIONS))),
+);
+
+export const savePins = (pins: ReadonlySet<ProductId>) => Effect.promise(() => pinnedProducts.setValue([...pins]));
+
+export const saveOptions = (options: SolveOptions) => Effect.promise(() => solveOptions.setValue(options));
